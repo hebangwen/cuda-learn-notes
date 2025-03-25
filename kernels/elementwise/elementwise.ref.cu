@@ -22,32 +22,25 @@
 // grid(N/256), block(256)
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
 __global__ void elementwise_add_f32_kernel(float* a, float* b, float* c, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < N) {
-      c[tid] = a[tid] + b[tid];
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) c[idx] = a[idx] + b[idx];
 }
 
 // ElementWise Add + Vec4
 // grid(N/256), block(256/4)
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
 __global__ void elementwise_add_f32x4_kernel(float* a, float* b, float* c, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    tid <<= 2;
-    if (tid < N) {
-      float4 vec_a = FLOAT4(a[tid]);
-      float4 vec_b = FLOAT4(b[tid]);
-      float4 vec_c;
-      vec_c.x = vec_a.x + vec_b.x;
-      vec_c.y = vec_a.y + vec_b.y;
-      vec_c.z = vec_a.z + vec_b.z;
-      vec_c.w = vec_a.w + vec_b.w;
-      FLOAT4(c[tid]) = vec_c;
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 4 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    float4 reg_a = FLOAT4(a[idx]);
+    float4 reg_b = FLOAT4(b[idx]);
+    float4 reg_c;
+    reg_c.x = reg_a.x + reg_b.x;
+    reg_c.y = reg_a.y + reg_b.y;
+    reg_c.z = reg_a.z + reg_b.z;
+    reg_c.w = reg_a.w + reg_b.w;
+    FLOAT4(c[idx]) = reg_c;
+  }
 }
 
 // -------------------------------------- FP16 -------------------------------------- 
@@ -55,72 +48,63 @@ __global__ void elementwise_add_f32x4_kernel(float* a, float* b, float* c, int N
 // grid(N/256), block(256)
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
 __global__ void elementwise_add_f16_kernel(half* a, half* b, half* c, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < N) {
-      c[tid] = a[tid] + b[tid];
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) c[idx] = __hadd(a[idx], b[idx]);
 }
 
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
 __global__ void elementwise_add_f16x2_kernel(half* a, half* b, half* c, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gmem_id = tid << 1;
-    if (gmem_id < N) {
-      half2 vec_a = HALF2(a[gmem_id]);
-      half2 vec_b = HALF2(b[gmem_id]);
-      half2 vec_c;
-      vec_c.x = vec_a.x + vec_b.x;
-      vec_c.y = vec_a.y + vec_b.y;
-      /**
-      为什么使用 __hadd ?
-      1. `__hadd` 定义在 `<cuda_fp16.h>` 头文件中
-      2. 可能会有兼容性的提高
-      3. CUDA Half Arithmetic Functions: https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH____HALF__ARITHMETIC.html
-      */
-      // vec_c.x = __hadd(vec_a.x, vec_b.x);
-      // vec_c.y = __hadd(vec_a.y, vec_b.y);
-      HALF2(c[gmem_id]) = vec_c;
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    half2 reg_a = HALF2(a[idx]);
+    half2 reg_b = HALF2(b[idx]);
+    half2 reg_c;
+    reg_c.x = __hadd(reg_a.x, reg_b.x);
+    reg_c.y = __hadd(reg_a.y, reg_b.y);
+    HALF2(c[idx]) = reg_c;
+  }
 }
 
 __global__ void elementwise_add_f16x8_kernel(half* a, half* b, half* c, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gmem_id = tid << 3;
-    if (gmem_id < N) {
-      #pragma unroll
-      for (int i = 0; i < 4; i++) {
-        half2 vec_a = HALF2(a[gmem_id + i * 2]);
-        half2 vec_b = HALF2(b[gmem_id + i * 2]);
-        // https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH____HALF2__ARITHMETIC.html
-        half2 vec_c = __hadd2(vec_a, vec_b);
-        HALF2(c[gmem_id + i * 2]) = vec_c;
-      }
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  half2 reg_a_0 = HALF2(a[idx + 0]);
+  half2 reg_a_1 = HALF2(a[idx + 2]);
+  half2 reg_a_2 = HALF2(a[idx + 4]);
+  half2 reg_a_3 = HALF2(a[idx + 6]);
+  half2 reg_b_0 = HALF2(b[idx + 0]);
+  half2 reg_b_1 = HALF2(b[idx + 2]);
+  half2 reg_b_2 = HALF2(b[idx + 4]);
+  half2 reg_b_3 = HALF2(b[idx + 6]);
+  half2 reg_c_0, reg_c_1, reg_c_2, reg_c_3;
+  reg_c_0.x = __hadd(reg_a_0.x, reg_b_0.x);
+  reg_c_0.y = __hadd(reg_a_0.y, reg_b_0.y);
+  reg_c_1.x = __hadd(reg_a_1.x, reg_b_1.x);
+  reg_c_1.y = __hadd(reg_a_1.y, reg_b_1.y);
+  reg_c_2.x = __hadd(reg_a_2.x, reg_b_2.x);
+  reg_c_2.y = __hadd(reg_a_2.y, reg_b_2.y);
+  reg_c_3.x = __hadd(reg_a_3.x, reg_b_3.x);
+  reg_c_3.y = __hadd(reg_a_3.y, reg_b_3.y);
+  if ((idx + 0) < N) { HALF2(c[idx + 0]) = reg_c_0; }
+  if ((idx + 2) < N) { HALF2(c[idx + 2]) = reg_c_1; }
+  if ((idx + 4) < N) { HALF2(c[idx + 4]) = reg_c_2; }
+  if ((idx + 6) < N) { HALF2(c[idx + 6]) = reg_c_3; }
 }
 
 __global__ void elementwise_add_f16x8_pack_kernel(half* a, half* b, half* c, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    half2 vec_a[4], vec_b[4], vec_c[4];
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gmem_id = tid << 3;
-    if (gmem_id < N) {
-      // 使用 float4 一次性读取 8 个 half, 即 128 bit
-      LDST128BITS(vec_a[0]) = LDST128BITS(a[gmem_id]);
-      LDST128BITS(vec_b[0]) = LDST128BITS(b[gmem_id]);
-      vec_c[0] = __hadd2(vec_a[0], vec_b[0]);
-      vec_c[1] = __hadd2(vec_a[1], vec_b[1]);
-      vec_c[2] = __hadd2(vec_a[2], vec_b[2]);
-      vec_c[3] = __hadd2(vec_a[3], vec_b[3]);
-      LDST128BITS(c[gmem_id]) = LDST128BITS(vec_c[0]);
-    }
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  // temporary register(memory), .local space in ptx, addressable
+  half pack_a[8], pack_b[8], pack_c[8]; // 8x16 bits=128 bits.
+  // reinterpret as float4 and load 128 bits in 1 memory issue.
+  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
+  LDST128BITS(pack_b[0]) = LDST128BITS(b[idx]); // load 128 bits
 
-    // [END MANUAL IMPLEMENTATION]
+  #pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    // __hadd2 for half2 x 4
+    HALF2(pack_c[i]) = __hadd2(HALF2(pack_a[i]), HALF2(pack_b[i]));
+  }
+  // reinterpret as float4 and store 128 bits in 1 memory issue.
+  if ((idx + 7) < N) { LDST128BITS(c[idx]) = LDST128BITS(pack_c[0]); }
 }
 
 
