@@ -16,33 +16,22 @@
 // grid(N/256), block(256)
 // a: Nx1, y: count histogram, a >= 1
 __global__ void histogram_i32_kernel(int* a, int* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < N) {
-      int val = a[tid];
-      // 使用原子加法，避免写回到 y 时出现结果被覆盖的情况
-      // 如果打印的 histogram 不是 1000，则说明没有使用 atomicAdd
-      // atomicAdd 需要传入地址，而不是变量值，因为 CUDA 驱动实际上是对这个地址的写入操作进行原子性控制
-      atomicAdd(&y[val], 1);
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) atomicAdd(&(y[a[idx]]), 1);
 }
 
 // Histogram + Vec4
 // grid(N/256), block(256/4)
 // a: Nx1, y: count histogram, a >= 1
 __global__ void histogram_i32x4_kernel(int* a, int* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 2;
-    int4 vals = INT4(a[gid]);
-    if (gid < N) {
-      atomicAdd(&y[vals.x], 1);
-      atomicAdd(&y[vals.y], 1);
-      atomicAdd(&y[vals.z], 1);
-      atomicAdd(&y[vals.w], 1);
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 4 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    int4 reg_a = INT4(a[idx]);
+    atomicAdd(&(y[reg_a.x]), 1);
+    atomicAdd(&(y[reg_a.y]), 1);
+    atomicAdd(&(y[reg_a.z]), 1);
+    atomicAdd(&(y[reg_a.w]), 1);
+  }
 }
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
