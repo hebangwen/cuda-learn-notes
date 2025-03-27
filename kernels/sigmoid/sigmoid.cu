@@ -62,11 +62,14 @@ __global__ void sigmoid_f16_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
     // 使用 hexp 和 __hmax __hmin , operator< > 也可以用
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const half one = __float2half(1.0);
     if (tid < N) {
       half val = __hmax(__hmin(x[tid], MAX_EXP_F16), MIN_EXP_F16);
       // 注意：这条语句编译会产生报错，不支持 int + __half 的操作符
       // half sig = 1 / (1 + hexp(-val));
       // y[tid] = sig;
+      half sig = one / (one + hexp(-val));
+      y[tid] = sig;
     }
     // [END MANUAL IMPLEMENTATION]
 }
@@ -75,14 +78,15 @@ __global__ void sigmoid_f16x2_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     int gid = tid << 1;
+    const half one = __float2half(1.0);
     if (gid < N) {
       half2 reg_x = HALF2(x[gid]);
       reg_x.x = __hmax(__hmin(reg_x.x, MAX_EXP_F16), MIN_EXP_F16);
       reg_x.y = __hmax(__hmin(reg_x.y, MAX_EXP_F16), MIN_EXP_F16);
 
       half2 reg_sig;
-      reg_sig.x = 1 / (1 + hexp(-reg_x.x));
-      reg_sig.y = 1 / (1 + hexp(-reg_x.y));
+      reg_sig.x = one / (one + hexp(-reg_x.x));
+      reg_sig.y = one / (one + hexp(-reg_x.y));
 
       HALF2(y[gid]) = reg_sig;
     }
@@ -92,14 +96,48 @@ __global__ void sigmoid_f16x2_kernel(half* x, half* y, int N) {
 // unpack f16x8
 __global__ void sigmoid_f16x8_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int gid = tid << 3;
+    const half one = __float2half(1.0f);
+    if (gid < N) {
+      half2 reg_x[4], reg_y[4];
+  #pragma unroll
+      for (int i = 0; i < 4; i++) {
+          reg_x[i] = HALF2(x[gid + (i << 1)]);
+
+          reg_x[i].x = __hmax(__hmin(reg_x[i].x, MAX_EXP_F16), MIN_EXP_F16);
+          reg_x[i].y = __hmax(__hmin(reg_x[i].y, MAX_EXP_F16), MIN_EXP_F16);
+          reg_y[i].x = one / (one + hexp(-reg_x[i].x));
+          reg_y[i].y = one / (one + hexp(-reg_x[i].y));
+      }
+
+      HALF2(y[gid + 0]) = reg_y[0];
+      HALF2(y[gid + 2]) = reg_y[1];
+      HALF2(y[gid + 4]) = reg_y[2];
+      HALF2(y[gid + 6]) = reg_y[3];
+    }
     // [END MANUAL IMPLEMENTATION]
 }
 
 // pack f16x8
 __global__ void sigmoid_f16x8_pack_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int gid = tid << 3;
+    const half one = __float2half(1.0f);
+    if (gid < N) {
+      half2 reg_x[4], reg_y[4];
+      LDST128BITS(reg_x[0]) = LDST128BITS(x[gid]);
+  #pragma unroll
+      for (int i = 0; i < 4; i++) {
+          reg_x[i].x = __hmax(__hmin(reg_x[i].x, MAX_EXP_F16), MIN_EXP_F16);
+          reg_x[i].y = __hmax(__hmin(reg_x[i].y, MAX_EXP_F16), MIN_EXP_F16);
+          reg_y[i].x = one / (one + hexp(-reg_x[i].x));
+          reg_y[i].y = one / (one + hexp(-reg_x[i].y));
+      }
+
+      LDST128BITS(y[gid]) = LDST128BITS(reg_y[0]);
+    }
     // [END MANUAL IMPLEMENTATION]
 }
 
