@@ -49,6 +49,7 @@ def torch_elu(x, out=None):
     if out is None:
         return torch.where(x > 0, x, 1.0 * (torch.exp(x) - 1))
     else:
+        # torch 这里是多个算子组合的，所以比 cuda 实现慢
         torch.where(x > 0, x, 1.0 * (torch.exp(x) - 1), out=out)
         return out
 

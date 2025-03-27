@@ -44,93 +44,71 @@ __device__ __forceinline__ half elu_half(half x) {
 // CUDA 核函数
 // -------------------------------------- FP32 --------------------------------------
 __global__ void elu_f32_kernel(float* x, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < N) {
-        float value = x[tid];
-        value = elu(value);
-        y[tid] = value;
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) y[idx] = elu(x[idx]);
 }
 
 __global__ void elu_f32x4_kernel(float* x, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 2;
-    if (gid < N) {
-        float4 reg_x = FLOAT4(x[gid]);
-        float4 reg_y;
-        reg_y.x = elu(reg_x.x);
-        reg_y.y = elu(reg_x.y);
-        reg_y.z = elu(reg_x.z);
-        reg_y.w = elu(reg_x.w);
-        FLOAT4(y[gid]) = reg_y;
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (idx < N) {
+    float4 reg_x = FLOAT4(x[idx]);
+    float4 reg_y;
+    reg_y.x = elu(reg_x.x);
+    reg_y.y = elu(reg_x.y);
+    reg_y.z = elu(reg_x.z);
+    reg_y.w = elu(reg_x.w);
+    FLOAT4(y[idx]) = reg_y;
     }
-    // [END MANUAL IMPLEMENTATION]
 }
 
 // -------------------------------------- FP16 --------------------------------------
 __global__ void elu_f16_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < N) {
-        half value = x[tid];
-        value = elu_half(value);
-        y[tid] = value;
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) y[idx] = elu_half(x[idx]);
 }
 
 __global__ void elu_f16x2_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 1;
-    if (gid < N) {
-        half2 reg_x = HALF2(x[gid]);
-        half2 reg_y;
-        reg_y.x = elu_half(reg_x.x);
-        reg_y.y = elu_half(reg_x.y);
-        HALF2(y[gid]) = reg_y;
+  int idx = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    half2 reg_x = HALF2(x[idx]);
+    half2 reg_y;
+    reg_y.x = elu_half(reg_x.x);
+    reg_y.y = elu_half(reg_x.y);
+    HALF2(y[idx]) = reg_y;
     }
-    // [END MANUAL IMPLEMENTATION]
 }
 
 __global__ void elu_f16x8_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 3;
-    if (gid < N) {
-        half2 reg_x[4], reg_y[4];
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            reg_x[i] = HALF2(x[gid + (i << 1)]);
-            reg_y[i].x = elu_half(reg_x[i].x);
-            reg_y[i].y = elu_half(reg_x[i].y);
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            HALF2(y[gid + (i << 1)]) = reg_y[i];
-        }
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  half2 reg_x_0 = HALF2(x[idx + 0]);
+  half2 reg_x_1 = HALF2(x[idx + 2]);
+  half2 reg_x_2 = HALF2(x[idx + 4]);
+  half2 reg_x_3 = HALF2(x[idx + 6]);
+  half2 reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+  reg_y_0.x = elu_half(reg_x_0.x);
+  reg_y_0.y = elu_half(reg_x_0.y);
+  reg_y_1.x = elu_half(reg_x_1.x);
+  reg_y_1.y = elu_half(reg_x_1.y);
+  reg_y_2.x = elu_half(reg_x_2.x);
+  reg_y_2.y = elu_half(reg_x_2.y);
+  reg_y_3.x = elu_half(reg_x_3.x);
+  reg_y_3.y = elu_half(reg_x_3.y);
+  if ((idx + 0) < N) { HALF2(y[idx + 0]) = reg_y_0; }
+  if ((idx + 2) < N) { HALF2(y[idx + 2]) = reg_y_1; }
+  if ((idx + 4) < N) { HALF2(y[idx + 4]) = reg_y_2; }
+  if ((idx + 6) < N) { HALF2(y[idx + 6]) = reg_y_3; }
 }
 
 __global__ void elu_f16x8_pack_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 3;
-    if (gid < N) {
-        half2 reg_x[4], reg_y[4];
-        LDST128BITS(reg_x[0]) = LDST128BITS(x[gid]);
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            reg_y[i].x = elu_half(reg_x[i].x);
-            reg_y[i].y = elu_half(reg_x[i].y);
-        }
-        LDST128BITS(y[gid]) = LDST128BITS(reg_y[0]);
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  half pack_x[8], pack_y[8];
+  LDST128BITS(pack_x[0]) = LDST128BITS(x[idx]);
+
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    pack_y[i] = elu_half(pack_x[i]);
     }
-    // [END MANUAL IMPLEMENTATION]
+  if ((idx + 7) < N) { LDST128BITS(y[idx]) = LDST128BITS(pack_y[0]); }
 }
 
 // PyTorch 绑定代码
