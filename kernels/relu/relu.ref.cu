@@ -19,99 +19,78 @@
 // Relu x: N, y: N y=max(0,x)
 // grid(N/256), block(K=256) 
 __global__ void relu_f32_kernel(float* x, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < N) {
-      y[tid] = fmaxf(x[tid], 0.0f);
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) y[idx] = fmaxf(0.0f, x[idx]);
 }
 
 // Relu x: N, y: N y=max(0,x) Vec4
 // grid(N/256/4), block(256/4) 
 __global__ void relu_f32x4_kernel(float* x, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 2;
-    if (gid < N) {
-      float4 reg_x = FLOAT4(x[gid]);
-      float4 reg_y;
-      reg_y.x = fmaxf(reg_x.x, 0.0f);
-      reg_y.y = fmaxf(reg_x.y, 0.0f);
-      reg_y.z = fmaxf(reg_x.z, 0.0f);
-      reg_y.w = fmaxf(reg_x.w, 0.0f);
-      FLOAT4(y[gid]) = reg_y;
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (idx < N) {
+    float4 reg_x = FLOAT4(x[idx]);
+    float4 reg_y;
+    reg_y.x = fmaxf(0.0f, reg_x.x);
+    reg_y.y = fmaxf(0.0f, reg_x.y);
+    reg_y.z = fmaxf(0.0f, reg_x.z);
+    reg_y.w = fmaxf(0.0f, reg_x.w);
+    FLOAT4(y[idx]) = reg_y;
+  }
 }
 
 // -------------------------------------- FP16 -------------------------------------- 
 __global__ void relu_f16_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    const half zero = __float2half(0.0f);
-    if (tid < N) {
-      y[tid] = __hmax(x[tid], zero);
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) y[idx] = __hmax(__float2half(0.0f), x[idx]);
 }
 
 __global__ void relu_f16x2_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    const half zero = __float2half(0.0f);
-    int gid = tid << 1;
-    if (gid < N) {
-      half2 reg_x = HALF2(x[gid]);
-      half2 reg_y;
-      reg_y.x = __hmax(reg_x.x, zero);
-      reg_y.y = __hmax(reg_x.y, zero);
-      HALF2(y[gid]) = reg_y;
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    half2 reg_x = HALF2(x[idx]);
+    half2 reg_y = HALF2(y[idx]);
+    reg_y.x = __hmax(__float2half(0.0f), reg_x.x);
+    reg_y.y = __hmax(__float2half(0.0f), reg_x.y);
+    HALF2(y[idx]) = reg_y;
+  }
 }
 
 __global__ void relu_f16x8_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 3;
-    const half zero = __float2half(0.0f);
-    if (gid < N) {
-      half2 reg_x[4], reg_y[4];
-      #pragma unroll
-      for (int i = 0; i < 4; i++) {
-        reg_x[i] = HALF2(x[gid + (i << 1)]);
-      }
-      #pragma unroll
-      for (int i = 0; i < 4; i++) {
-        reg_y[i].x = __hmax(reg_x[i].x, zero);
-        reg_y[i].y = __hmax(reg_x[i].y, zero);
-      }
-      #pragma unroll
-      for (int i = 0; i < 4; i++) {
-        HALF2(y[gid + (i << 1)]) = reg_y[i];
-      }
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  half2 reg_x_0 = HALF2(x[idx + 0]);
+  half2 reg_x_1 = HALF2(x[idx + 2]);
+  half2 reg_x_2 = HALF2(x[idx + 4]);
+  half2 reg_x_3 = HALF2(x[idx + 6]);
+  half2 reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+  reg_y_0.x = __hmax(__float2half(0.0f), reg_x_0.x);
+  reg_y_0.y = __hmax(__float2half(0.0f), reg_x_0.y);
+  reg_y_1.x = __hmax(__float2half(0.0f), reg_x_1.x);
+  reg_y_1.y = __hmax(__float2half(0.0f), reg_x_1.y);
+  reg_y_2.x = __hmax(__float2half(0.0f), reg_x_2.x);
+  reg_y_2.y = __hmax(__float2half(0.0f), reg_x_2.y);
+  reg_y_3.x = __hmax(__float2half(0.0f), reg_x_3.x);
+  reg_y_3.y = __hmax(__float2half(0.0f), reg_x_3.y);
+  if ((idx + 0) < N) { HALF2(y[idx + 0]) = reg_y_0; }
+  if ((idx + 2) < N) { HALF2(y[idx + 2]) = reg_y_1; }
+  if ((idx + 4) < N) { HALF2(y[idx + 4]) = reg_y_2; }
+  if ((idx + 6) < N) { HALF2(y[idx + 6]) = reg_y_3; }
 }
 
 __global__ void relu_f16x8_pack_kernel(half* x, half* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = tid << 3;
-    const half2 zero2 = {__float2half(0.0f), __float2half(0.0f)};
-    if (gid < N) {
-      half2 reg_x[4], reg_y[4];
-      LDST128BITS(reg_x[0]) = LDST128BITS(x[gid]);
-      #pragma unroll
-      for (int i = 0; i < 4; i++) {
-        // reg_y[i].x = __hmax(reg_x[i].x, zero);
-        // reg_y[i].y = __hmax(reg_x[i].y, zero);
-        reg_y[i] = __hmax2(reg_x[i], zero2);
-      }
-      LDST128BITS(y[gid]) = LDST128BITS(reg_y[0]);
-    }
-    // [END MANUAL IMPLEMENTATION]
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  const half2 z2 = {__float2half(0.0f), __float2half(0.0f)};
+  // temporary register(memory), .local space in ptx, addressable
+  half pack_x[8], pack_y[8]; // 8x16 bits=128 bits.
+  // reinterpret as float4 and load 128 bits in 1 memory issue.
+  LDST128BITS(pack_x[0]) = LDST128BITS(x[idx]); // load 128 bits
+
+  #pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    // __hmax2 for half2 x 4
+    HALF2(pack_y[i]) = __hmax2(HALF2(pack_x[i]), z2);
+  } 
+  // reinterpret as float4 and store 128 bits in 1 memory issue.
+  if ((idx + 7) < N) { LDST128BITS(y[idx]) = LDST128BITS(pack_y[0]); }
 }
 
 
