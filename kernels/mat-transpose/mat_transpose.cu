@@ -158,10 +158,26 @@ __global__ void mat_transpose_f32x4_row2col2d_kernel(
 __global__ void mat_transpose_f32x4_shared_col2row2d_kernel(
   float *x, float *y, const int row, const int col){
     // [START MANUAL IMPLEMENTATION]
-    // 每个子线程读取 4 个 float 到 shared memory 中
-    // 等 block 内读取完毕之后，同步
-    // 从共享内存中取出被转置的 4 个 float
-    // 写回到 y 中
+    __shared__ float tile[WARP_SIZE_S * WARP_SIZE_S * 4];
+    int gx = (threadIdx.x + blockIdx.x * blockDim.x) << 2;
+    int gy = threadIdx.y + blockIdx.y * blockDim.y;
+    if (gx < col && gy < row) {
+      float4 rx = FLOAT4(x[gx + gy * col]);
+      int tid = threadIdx.x + threadIdx.y * WARP_SIZE_S;
+      FLOAT4(tile[tid << 2]) = rx;
+      __syncthreads();
+      float4 ry;
+      // 16 * 16 -> 16/4 * 16*4
+      int ttx = tid % (WARP_SIZE_S * 4);
+      int tty = tid / (WARP_SIZE_S * 4);
+      ry.x = tile[ttx + WARP_SIZE_S * 4 * (4 * tty)];
+      ry.y = tile[ttx + WARP_SIZE_S * 4 * (4 * tty + 1)];
+      ry.z = tile[ttx + WARP_SIZE_S * 4 * (4 * tty + 2)];
+      ry.w = tile[ttx + WARP_SIZE_S * 4 * (4 * tty + 3)];
+      int trans_x = blockIdx.y * blockDim.y + tty * 4;
+      int trans_y = 4 * blockIdx.x * blockDim.x + ttx;
+      FLOAT4(y[trans_x + trans_y * row]) = ry;
+    }
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -176,6 +192,7 @@ __global__ void mat_transpose_f32x4_shared_bcf_col2row2d_kernel(
   float *x, float *y, const int row, const int col){
     // [START MANUAL IMPLEMENTATION]
     // TODO: 请在此实现内核代码
+    // bcf -> bank conflict fix
     // [END MANUAL IMPLEMENTATION]
 }
 
