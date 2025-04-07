@@ -27,8 +27,19 @@
 // CUDA温故(0x00): 一步步学习block all reduce: 从FP32到FP16/BF16，再到FP8
 // -------------------------------------- FP32 -------------------------------------- 
 // Warp Reduce Sum
+
+// 线程束洗牌函数： http://www.zh0ngtian.tech/posts/ada27037.html
+// shfl -> shuffle，而不是 shift left
+
+// 这个函数把单个 warp 内的数据并行求和到 val 中
+// 传入的参数实际上就是整个 warp 里的所有寄存器 val
 template<const int kWarpSize = WARP_SIZE>
 __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
+  // 函数作用，让当前线程束能够访问同一个 warp 内部的寄存器而不需要经过 smem
+  // 所以能够实现一个 warp 内部归约算法
+  // 同时，异或相当于一个加法，当第一次 mask=16 时，thread-0 得到 thread-16 寄存器的值，这样前 16 个元素就得到了 32 个元素之和
+  // 下一步，当 mask=8，thread-0 得到 thread-8 的寄存器，前 8 个元素保存了 32 个元素之和
+  // 一直迭代直到 mask=0
   #pragma unroll
   for (int mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
     val += __shfl_xor_sync(0xffffffff, val, mask);
@@ -41,23 +52,25 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
 // a: Nx1, y=sum(a)
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_f32_f32_kernel(float* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-  // keep the data in register is enough for warp operaion.
-  float sum = (idx < N) ? a[idx] : 0.0f;
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
-  // warp leaders store the data to shared memory.
-  if (lane == 0) reduce_smem[warp] = sum;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int WARP_NUM = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[WARP_NUM];
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    float val = gid < N ? a[gid] : 0.0f;
+    // 256 -> 256/32 = 8
+    val = warp_reduce_sum_f32<WARP_SIZE>(val);
+    if (lane == 0) smem[warp] = val;
+    __syncthreads();
+
+    // 8 -> 1
+    val = lane < WARP_NUM ? smem[lane] : 0.0f;
+    if (warp == 0) val = warp_reduce_sum_f32<WARP_NUM>(val);
+    // N/256 -> 1
+    if (tid == 0) atomicAdd(y, val);
+    // [END MANUAL IMPLEMENTATION]
 }
 
 // Block All Reduce Sum + float4
@@ -65,25 +78,9 @@ __global__ void block_all_reduce_sum_f32_f32_kernel(float* a, float* y, int N) {
 // a: Nx1, y=sum(a)
 template<const int NUM_THREADS = 256/4>
 __global__ void block_all_reduce_sum_f32x4_f32_kernel(float* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 4;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-
-  float4 reg_a = FLOAT4(a[idx]);
-  // keep the data in register is enough for warp operaion.
-  float sum = (idx < N) ? (reg_a.x + reg_a.y + reg_a.z + reg_a.w) : 0.0f;
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
-  // warp leaders store the data to shared memory.
-  if (lane == 0) reduce_smem[warp] = sum;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 // -------------------------------------- FP16 -------------------------------------- 
@@ -113,163 +110,44 @@ __device__ __forceinline__ float warp_reduce_sum_f16_f32(half val) {
 // a: Nx1, y=sum(a)
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_f16_f16_kernel(half* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-  // keep the data in register is enough for warp operaion.
-  half sum_f16 = (idx < N) ? a[idx] : __float2half(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = __half2float(sum_f16);
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_f16_f32_kernel(half* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-  // keep the data in register is enough for warp operaion.
-  half sum_f16 = (idx < N) ? a[idx] : __float2half(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  float sum_f32 = warp_reduce_sum_f16_f32<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_f16x2_f32_kernel(half* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 2; // 2 half elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  half2 reg_a = HALF2(a[idx]);
-  half sum_f16 = (idx < N) ? __hadd(reg_a.x, reg_a.y) : __float2half(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  float sum_f32 = warp_reduce_sum_f16_f32<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_f16x2_f16_kernel(half* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 2; // 2 half elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  half2 reg_a = HALF2(a[idx]);
-  half sum_f16 = (idx < N) ? __hadd(reg_a.x, reg_a.y) : __float2half(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = __half2float(sum_f16);
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_f16x8_pack_f16_kernel(half* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 8; // 8 half elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-  // temporary register(memory), .local space in ptx, addressable
-  half pack_a[8]; // 8x16 bits=128 bits.
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-  const half z = __float2half(0.0f);
-
-  half sum_f16 = z;
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    sum_f16 += (((idx + i ) < N) ? pack_a[i] : z);
-  }
-
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = __half2float(sum_f16);
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_f16x8_pack_f32_kernel(half* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 8; // 8 half elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-  // temporary register(memory), .local space in ptx, addressable
-  half pack_a[8]; // 8x16 bits=128 bits.
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-
-  float sum_f32 = 0.0f;
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    sum_f32 += (((idx + i ) < N) ? __half2float(pack_a[i]) : 0.0f);
-  }
-
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_f32 = warp_reduce_sum_f32<WARP_SIZE>(sum_f32);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 // -------------------------------------- BF16 -------------------------------------- 
@@ -301,173 +179,49 @@ __device__ __forceinline__ float warp_reduce_sum_bf16_f32(
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_bf16_bf16_kernel(
   __nv_bfloat16* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ __nv_bfloat16 reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  __nv_bfloat16 sum_bf16 = (idx < N) ? a[idx] : __float2bfloat16(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_bf16 = warp_reduce_sum_bf16_bf16<WARP_SIZE>(sum_bf16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_bf16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  __nv_bfloat16 sum = (lane < NUM_WARPS) ? reduce_smem[lane] : __float2bfloat16(0.0f);
-  if (warp == 0) sum = warp_reduce_sum_bf16_bf16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __bfloat162float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_bf16_f32_kernel(
   __nv_bfloat16* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  __nv_bfloat16 sum_bf16 = (idx < N) ? a[idx] : __float2bfloat16(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  float sum_f32 = warp_reduce_sum_bf16_f32<WARP_SIZE>(sum_bf16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_bf16x2_bf16_kernel(
   __nv_bfloat16* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 2; // 2 bf16 elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ __nv_bfloat16 reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  __nv_bfloat162 reg_a = BFLOAT2(a[idx]);
-  __nv_bfloat16 sum_bf16 = (idx < N) ? __hadd(reg_a.x, reg_a.y) : __float2bfloat16(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_bf16 = warp_reduce_sum_bf16_bf16<WARP_SIZE>(sum_bf16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_bf16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  __nv_bfloat16 sum = (lane < NUM_WARPS) ? reduce_smem[lane] : __float2bfloat16(0.0f);
-  if (warp == 0) sum = warp_reduce_sum_bf16_bf16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __bfloat162float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_bf16x2_f32_kernel(
   __nv_bfloat16* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 2; // 2 bf16 elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  __nv_bfloat162 reg_a = BFLOAT2(a[idx]);
-  __nv_bfloat16 sum_bf16 = (idx < N) ? __hadd(reg_a.x, reg_a.y) : __float2bfloat16(0.0f);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  float sum_f32 = warp_reduce_sum_bf16_f32<WARP_SIZE>(sum_bf16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_bf16x8_pack_bf16_kernel(
   __nv_bfloat16* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 8; // 8 bf16 elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ __nv_bfloat16 reduce_smem[NUM_WARPS];
-  // temporary register(memory), .local space in ptx, addressable
-  __nv_bfloat16 pack_a[8]; // 8x16 bits=128 bits.
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-  const __nv_bfloat16 z = __float2bfloat16(0.0f);
-
-  __nv_bfloat16 sum_bf16 = z;
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    sum_bf16 += (((idx + i ) < N) ? pack_a[i] : z);
-  }
-
-  // keep the data in register is enough for warp operaion.
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_bf16 = warp_reduce_sum_bf16_bf16<WARP_SIZE>(sum_bf16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_bf16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  __nv_bfloat16 sum = (lane < NUM_WARPS) ? reduce_smem[lane] : z;
-  if (warp == 0) sum = warp_reduce_sum_bf16_bf16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __bfloat162float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_bf16x8_pack_f32_kernel(
   __nv_bfloat16* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 8; // 8 bf16 elements per thread
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ float reduce_smem[NUM_WARPS];
-  // temporary register(memory), .local space in ptx, addressable
-  __nv_bfloat16 pack_a[8]; // 8x16 bits=128 bits.
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-  const __nv_bfloat16 z = __float2bfloat16(0.0f);
-
-  __nv_bfloat16 sum_bf16 = z;
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    sum_bf16 += (((idx + i ) < N) ? pack_a[i] : z);
-  }
-
-  // keep the data in register is enough for warp operaion.
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  float sum_f32 = warp_reduce_sum_bf16_f32<WARP_SIZE>(sum_bf16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp32 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  float sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
-  if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 // -------------------------------------- FP8 -------------------------------------- 
@@ -500,117 +254,33 @@ __device__ __forceinline__ half warp_reduce_sum_fp8_e5m2_f16(
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_fp8_e4m3_f16_kernel(
   __nv_fp8_storage_t* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ half reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  __nv_fp8_storage_t sum_f8 = (idx < N) ? a[idx] : __nv_cvt_float_to_fp8(
-    0.0f, __NV_SATFINITE, __NV_E4M3);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  half sum_f16 = warp_reduce_sum_fp8_e4m3_f16<WARP_SIZE>(sum_f8);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp16 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  half sum = (lane < NUM_WARPS) ? reduce_smem[lane] : __float2half(0.0f);
-  if (warp == 0) sum = warp_reduce_sum_f16_f16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __half2float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_fp8_e5m2_f16_kernel(
   __nv_fp8_storage_t* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ half reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  __nv_fp8_storage_t sum_f8 = (idx < N) ? a[idx] : __nv_cvt_float_to_fp8(
-    0.0f, __NV_SATFINITE, __NV_E5M2);
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  half sum_f16 = warp_reduce_sum_fp8_e5m2_f16<WARP_SIZE>(sum_f8);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp16 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  half sum = (lane < NUM_WARPS) ? reduce_smem[lane] : __float2half(0.0f);
-  if (warp == 0) sum = warp_reduce_sum_f16_f16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __half2float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/16>
 __global__ void block_all_reduce_sum_fp8_e4m3x16_pack_f16_kernel(
   __nv_fp8_storage_t* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 16;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ half reduce_smem[NUM_WARPS];
-  __nv_fp8_storage_t pack_a[16]; // 16x8 bits=128 bits.
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-
-  half sum_f16 = __float2half(0.0f);
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    sum_f16 += __nv_cvt_fp8_to_halfraw(pack_a[i], __NV_E4M3);
-  }
-  // keep the data in register is enough for warp operaion.
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp16 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  half sum = (lane < NUM_WARPS) ? reduce_smem[lane] : __float2half(0.0f);
-  if (warp == 0) sum = warp_reduce_sum_f16_f16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __half2float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/16>
 __global__ void block_all_reduce_sum_fp8_e5m2x16_pack_f16_kernel(
   __nv_fp8_storage_t* a, float* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 16;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ half reduce_smem[NUM_WARPS];
-  __nv_fp8_storage_t pack_a[16]; // 16x8 bits=128 bits.
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-
-  half sum_f16 = __float2half(0.0f);
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    sum_f16 += __nv_cvt_fp8_to_halfraw(pack_a[i], __NV_E5M2);
-  }
-  // keep the data in register is enough for warp operaion.
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(sum_f16);
-  // warp leaders store the data to shared memory.
-  // use float to keep sum from each block and reduce 
-  // with fp16 inter warps.
-  if (lane == 0) reduce_smem[warp] = sum_f16;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  half sum = (lane < NUM_WARPS) ? reduce_smem[lane] : __float2half(0.0f);
-  if (warp == 0) sum = warp_reduce_sum_f16_f16<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, __half2float(sum));
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 // -------------------------------------- INT8 -------------------------------------- 
@@ -636,53 +306,17 @@ __device__ __forceinline__ int32_t warp_reduce_sum_i32_i32(int32_t val) {
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_i8_i32_kernel(
   int8_t* a, int32_t* y, int N) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x * NUM_THREADS + tid;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ int32_t reduce_smem[NUM_WARPS];
-
-  // keep the data in register is enough for warp operaion.
-  int8_t sum_i8 = (idx < N) ? a[idx] : 0;
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  int32_t sum_i32 = warp_reduce_sum_i8_i32<WARP_SIZE>(sum_i8);
-  if (lane == 0) reduce_smem[warp] = sum_i32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  int32_t sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0;
-  if (warp == 0) sum = warp_reduce_sum_i32_i32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/16>
 __global__ void block_all_reduce_sum_i8x16_pack_i32_kernel(
   int8_t* a, int32_t* y, int N) {
-  int tid = threadIdx.x;
-  int idx = (blockIdx.x * NUM_THREADS + tid) * 16;
-  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
-  __shared__ int32_t reduce_smem[NUM_WARPS];
-  int8_t pack_a[16]; // 16x8=128 bits
-  // reinterpret as float4 and load 128 bits in 1 memory issue.
-  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
-
-  // keep the data in register is enough for warp operaion.
-  int32_t sum_i32 = 0;
-  #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    sum_i32 += (static_cast<int32_t>(pack_a[i]));
-  }
-
-  int warp = tid / WARP_SIZE;
-  int lane = tid % WARP_SIZE;
-  // perform warp sync reduce.
-  sum_i32 = warp_reduce_sum_i32_i32<WARP_SIZE>(sum_i32);
-  if (lane == 0) reduce_smem[warp] = sum_i32;
-  __syncthreads(); // make sure the data is in shared memory.
-  // the first warp compute the final sum.
-  int32_t sum = (lane < NUM_WARPS) ? reduce_smem[lane] : 0;
-  if (warp == 0) sum = warp_reduce_sum_i32_i32<NUM_WARPS>(sum);
-  if (tid == 0) atomicAdd(y, sum);
+    // [START MANUAL IMPLEMENTATION]
+    // TODO: 请在此实现内核代码
+    // [END MANUAL IMPLEMENTATION]
 }
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
