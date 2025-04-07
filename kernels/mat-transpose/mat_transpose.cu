@@ -191,8 +191,36 @@ __global__ void mat_transpose_f32x4_shared_row2col2d_kernel(
 __global__ void mat_transpose_f32x4_shared_bcf_col2row2d_kernel(
   float *x, float *y, const int row, const int col){
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
-    // bcf -> bank conflict fix
+    // 每 32 个 float 添加一个 padding，由于 WARP_SIZE_S 为 16，那么每一行 16*4=32*2 个元素需要添加 2 个 padding
+    __shared__ float tile[WARP_SIZE_S * (WARP_SIZE_S * 4 + 2)];
+    int gx = (threadIdx.x + blockIdx.x * blockDim.x) * 4;
+    int gy = threadIdx.y + blockIdx.y * blockDim.y;
+    if (gx < col && gy < row) {
+      int tx = threadIdx.x;
+      int ty = threadIdx.y;
+      int tile_offset = ty * (WARP_SIZE_S * 4 + 2) + tx * 4 + tx / 8;
+      // 读取连续的 4 个元素
+      float4 rx = FLOAT4(x[gy * col + gx]);
+      tile[tile_offset] = rx.x;
+      tile[tile_offset + 1] = rx.y;
+      tile[tile_offset + 2] = rx.z;
+      tile[tile_offset + 3] = rx.w;
+      __syncthreads();
+
+      // 先读取完整的一列，再读取下一列
+      // 由于增加了 padding，所以列之间也没有 bank conflict
+      float4 ry;
+      int ttx = (ty * WARP_SIZE_S + tx) / 4;
+      int tty = (ty * WARP_SIZE_S + tx) % 4 * 4;
+      ry.x = tile[tty * (WARP_SIZE_S * 4 + 2) + ttx + ttx / 32];
+      ry.y = tile[(tty + 1) * (WARP_SIZE_S * 4 + 2) + ttx + ttx / 32];
+      ry.z = tile[(tty + 2) * (WARP_SIZE_S * 4 + 2) + ttx + ttx / 32];
+      ry.w = tile[(tty + 3) * (WARP_SIZE_S * 4 + 2) + ttx + ttx / 32];
+
+      int trans_x = blockIdx.y * blockDim.y + tty;
+      int trans_y = blockIdx.x * blockDim.x * 4 + ttx;
+      FLOAT4(y[trans_y * row + trans_x]) = ry;
+    }
     // [END MANUAL IMPLEMENTATION]
 }
 
