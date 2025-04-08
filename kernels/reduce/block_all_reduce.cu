@@ -55,8 +55,8 @@ __global__ void block_all_reduce_sum_f32_f32_kernel(float* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
     int tid = threadIdx.x;
     int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
-    constexpr int WARP_NUM = NUM_THREADS / WARP_SIZE;
-    __shared__ float smem[WARP_NUM];
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
     int warp = tid / WARP_SIZE;
     int lane = tid % WARP_SIZE;
     float val = gid < N ? a[gid] : 0.0f;
@@ -66,8 +66,8 @@ __global__ void block_all_reduce_sum_f32_f32_kernel(float* a, float* y, int N) {
     __syncthreads();
 
     // 8 -> 1
-    val = lane < WARP_NUM ? smem[lane] : 0.0f;
-    if (warp == 0) val = warp_reduce_sum_f32<WARP_NUM>(val);
+    val = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val = warp_reduce_sum_f32<NUM_WARPS>(val);
     // N/256 -> 1
     if (tid == 0) atomicAdd(y, val);
     // [END MANUAL IMPLEMENTATION]
@@ -79,7 +79,22 @@ __global__ void block_all_reduce_sum_f32_f32_kernel(float* a, float* y, int N) {
 template<const int NUM_THREADS = 256/4>
 __global__ void block_all_reduce_sum_f32x4_f32_kernel(float* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    float4 val = gid * 4 < N ? FLOAT4(a[gid * 4]) : float4{0.0f, 0.0f, 0.0f, 0.0f};
+    float sum = val.x + val.y + val.z + val.w;
+    sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
+
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = sum;
+    __syncthreads();
+
+    sum = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
+    if (tid == 0) atomicAdd(y, sum);
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -111,14 +126,40 @@ __device__ __forceinline__ float warp_reduce_sum_f16_f32(half val) {
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_f16_f16_kernel(half* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ half smem[NUM_WARPS];
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    half val = gid < N ? a[gid] : __float2half(0.0f);
+    val = warp_reduce_sum_f16_f16<WARP_SIZE>(val);
+    if (lane == 0) smem[warp] = val;
+    __syncthreads();
+
+    val = lane < NUM_WARPS ? smem[lane] : __float2half(0.0f);
+    if (warp == 0) val = warp_reduce_sum_f16_f16<NUM_WARPS>(val);
+    if (tid == 0) atomicAdd(y, __half2float(val));
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_f16_f32_kernel(half* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    half val = gid < N ? a[gid] : __float2half(0.0f);
+    float val_f32 = warp_reduce_sum_f16_f32<WARP_SIZE>(val);
+    if (lane == 0) smem[warp] = val_f32;
+    __syncthreads();
+
+    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
+    if (tid == 0) atomicAdd(y, val_f32);
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -180,7 +221,20 @@ template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_bf16_bf16_kernel(
   __nv_bfloat16* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ __nv_bfloat16 smem[NUM_WARPS];
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    __nv_bfloat16 val = gid < N ? a[gid] : __float2bfloat16(0.0f);
+    val = warp_reduce_sum_bf16_bf16<WARP_SIZE>(val);
+    if (lane == 0) smem[warp] = val;
+    __syncthreads();
+
+    val = lane < NUM_WARPS ? smem[lane] : __float2bfloat16(0.0f);
+    if (warp == 0) val = warp_reduce_sum_bf16_bf16<NUM_WARPS>(val);
+    if (tid == 0) atomicAdd(y, __bfloat162float(val));
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -188,7 +242,20 @@ template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_bf16_f32_kernel(
   __nv_bfloat16* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    __nv_bfloat16 val = gid < N ? a[gid] : __float2bfloat16(0.0f);
+    float val_f32 = warp_reduce_sum_bf16_f32<WARP_SIZE>(val);
+    if (lane == 0) smem[warp] = val_f32;
+    __syncthreads();
+
+    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
+    if (tid == 0) atomicAdd(y, val_f32);
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -307,7 +374,20 @@ template<const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_i8_i32_kernel(
   int8_t* a, int32_t* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ int32_t smem[NUM_WARPS];
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    int8_t val = gid < N ? a[gid] : 0;
+    int32_t val_i32 = warp_reduce_sum_i8_i32<WARP_SIZE>(val);
+    if (lane == 0) smem[warp] = val_i32;
+    __syncthreads();
+
+    val_i32 = lane < NUM_WARPS ? smem[lane] : 0;
+    if (warp == 0) val_i32 = warp_reduce_sum_i32_i32<NUM_WARPS>(val_i32);
+    if (tid == 0) atomicAdd(y, val_i32);
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -315,7 +395,29 @@ template<const int NUM_THREADS = 256/16>
 __global__ void block_all_reduce_sum_i8x16_pack_i32_kernel(
   int8_t* a, int32_t* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+    __shared__ int32_t smem[NUM_WARPS];
+    if (gid * 16 < N) {
+      int8_t reg[16];
+      LDST128BITS(reg[0]) = LDST128BITS(a[gid * 16]);
+      int32_t sum = 0;
+      #pragma unroll
+      for (int i = 0; i < 16; i++) {
+        sum += reg[i];
+      }
+      sum = warp_reduce_sum_i32_i32<WARP_SIZE>(sum);
+
+      int warp = tid / WARP_SIZE;
+      int lane = tid % WARP_SIZE;
+      if (lane == 0) smem[warp] = sum;
+      __syncthreads();
+
+      sum = lane < NUM_WARPS ? smem[lane] : 0;
+      if (warp == 0) sum = warp_reduce_sum_i32_i32<NUM_WARPS>(sum);
+      if (tid == 0) atomicAdd(y, sum);
+    }
     // [END MANUAL IMPLEMENTATION]
 }
 
