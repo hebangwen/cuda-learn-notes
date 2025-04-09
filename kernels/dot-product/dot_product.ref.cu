@@ -33,25 +33,24 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
 // a: Nx1, b: Nx1, y=sum(elementwise_mul(a,b))
 template<const int NUM_THREADS = 256>
 __global__ void dot_prod_f32_f32_kernel(float* a, float* b, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x;
-    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    __shared__ float smem[NUM_WARPS];
-    int warp = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    float val = gid < N ? a[gid] * b[gid] : 0.0f;
-    // 256 -> 256/32 = 8
-    val = warp_reduce_sum_f32<WARP_SIZE>(val);
-    if (lane == 0) smem[warp] = val;
-    __syncthreads();
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * NUM_THREADS + tid;
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  __shared__ float reduce_smem[NUM_WARPS];
 
-    // 8 -> 1
-    val = lane < NUM_WARPS ? smem[lane] : 0.0f;
-    if (warp == 0) val = warp_reduce_sum_f32<NUM_WARPS>(val);
-    // N/256 -> 1
-    if (tid == 0) atomicAdd(y, val);
-    // [END MANUAL IMPLEMENTATION]
+  // keep the data in register is enough for warp operaion.
+  float prod = (idx < N) ? a[idx] * b[idx] : 0.0f;
+  int warp = tid / WARP_SIZE;
+  int lane = tid % WARP_SIZE;
+  // perform warp sync reduce.
+  prod = warp_reduce_sum_f32<WARP_SIZE>(prod);
+  // warp leaders store the data to shared memory.
+  if (lane == 0) reduce_smem[warp] = prod;
+  __syncthreads(); // make sure the data is in shared memory.
+  // the first warp compute the final sum.
+  prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
+  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod);
+  if (tid == 0) atomicAdd(y, prod);
 }
 
 // Dot Product + Vec4
@@ -59,25 +58,26 @@ __global__ void dot_prod_f32_f32_kernel(float* a, float* b, float* y, int N) {
 // a: Nx1, b: Nx1, y=sum(elementwise_mul(a,b))
 template<const int NUM_THREADS = 256/4>
 __global__ void dot_prod_f32x4_f32_kernel(float* a, float* b, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x;
-    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    __shared__ float smem[NUM_WARPS];
-    float4 ra = gid * 4 < N ? FLOAT4(a[gid * 4]) : float4{0.0f, 0.0f, 0.0f, 0.0f};
-    float4 rb = gid * 4 < N ? FLOAT4(b[gid * 4]) : float4{0.0f, 0.0f, 0.0f, 0.0f};
-    float sum = ra.x*rb.x + ra.y*rb.y + ra.z*rb.z + ra.w*rb.w;
-    sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
+  int tid = threadIdx.x;
+  int idx = (blockIdx.x * NUM_THREADS + tid) * 4;
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  __shared__ float reduce_smem[NUM_WARPS];
 
-    int warp = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    if (lane == 0) smem[warp] = sum;
-    __syncthreads();
-
-    sum = lane < NUM_WARPS ? smem[lane] : 0.0f;
-    if (warp == 0) sum = warp_reduce_sum_f32<NUM_WARPS>(sum);
-    if (tid == 0) atomicAdd(y, sum);
-    // [END MANUAL IMPLEMENTATION]
+  float4 reg_a = FLOAT4(a[idx]);
+  float4 reg_b = FLOAT4(b[idx]);
+  float prod = (idx < N) ? (reg_a.x * reg_b.x + reg_a.y * reg_b.y 
+                          + reg_a.z * reg_b.z + reg_a.w * reg_b.w) : 0.0f;
+  int warp = tid / WARP_SIZE;
+  int lane = tid % WARP_SIZE;
+  // perform warp sync reduce.
+  prod = warp_reduce_sum_f32<WARP_SIZE>(prod);
+  // warp leaders store the data to shared memory.
+  if (lane == 0) reduce_smem[warp] = prod;
+  __syncthreads(); // make sure the data is in shared memory.
+  // the first warp compute the final sum.
+  prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
+  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod);
+  if (tid == 0) atomicAdd(y, prod);
 }
 
 // -------------------------------------- FP16 -------------------------------------- 
@@ -104,75 +104,81 @@ __device__ __forceinline__ float warp_reduce_sum_f16_f32(half val) {
 
 template<const int NUM_THREADS = 256>
 __global__ void dot_prod_f16_f32_kernel(half* a, half* b, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x;
-    int gid = threadIdx.x + blockIdx.x * NUM_THREADS;
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    __shared__ float smem[NUM_WARPS];
-    int warp = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    half val = gid < N ? a[gid] * b[gid] : __float2half(0.0f);
-    float val_f32 = warp_reduce_sum_f16_f32<WARP_SIZE>(val);
-    if (lane == 0) smem[warp] = val_f32;
-    __syncthreads();
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * NUM_THREADS + tid;
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  __shared__ float reduce_smem[NUM_WARPS];
 
-    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
-    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
-    if (tid == 0) atomicAdd(y, val_f32);
-    // [END MANUAL IMPLEMENTATION]
+  // keep the data in register is enough for warp operaion.
+  half prod_f16 = (idx < N) ? __hmul(a[idx], b[idx]) : __float2half(0.0f);
+  int warp = tid / WARP_SIZE;
+  int lane = tid % WARP_SIZE;
+  // perform warp sync reduce.
+  float prod = warp_reduce_sum_f16_f32<WARP_SIZE>(prod_f16);
+  // warp leaders store the data to shared memory.
+  if (lane == 0) reduce_smem[warp] = prod;
+  __syncthreads(); // make sure the data is in shared memory.
+  // the first warp compute the final sum.
+  prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
+  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod);
+  if (tid == 0) atomicAdd(y, prod);
 }
 
 template<const int NUM_THREADS = 256/2>
 __global__ void dot_prod_f16x2_f32_kernel(half* a, half* b, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x;
-    int gid = threadIdx.x + blockIdx.x * blockDim.x;
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    __shared__ float smem[NUM_WARPS];
-    half2 ra = gid*2 < N ? HALF2(a[gid*2]) : half2{__float2half(0.0f), __float2half(0.0f)};
-    half2 rb = gid*2 < N ? HALF2(b[gid*2]) : half2{__float2half(0.0f), __float2half(0.0f)};
-    float val_f32 = __half2float(ra.x) * __half2float(rb.x) + __half2float(ra.y) * __half2float(rb.y);
-    val_f32 = warp_reduce_sum_f32<WARP_SIZE>(val_f32);
-    int warp = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    if (lane == 0) smem[warp] = val_f32;
-    __syncthreads();
+  int tid = threadIdx.x;
+  int idx = (blockIdx.x * NUM_THREADS + tid) * 2; // 2 half elements per thread
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  __shared__ float reduce_smem[NUM_WARPS];
 
-    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
-    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
-    if (tid == 0) atomicAdd(y, val_f32);
-    // [END MANUAL IMPLEMENTATION]
+  // keep the data in register is enough for warp operaion.
+  half2 reg_a = HALF2(a[idx]);
+  half2 reg_b = HALF2(b[idx]);
+  half prod_f16 = (idx < N) ? __hadd(__hmul(reg_a.x, reg_b.x), 
+                                     __hmul(reg_a.y, reg_b.y)) : __float2half(0.0f);
+  int warp = tid / WARP_SIZE;
+  int lane = tid % WARP_SIZE;
+  // perform warp sync reduce.
+  float prod = warp_reduce_sum_f16_f32<WARP_SIZE>(prod_f16);
+  // warp leaders store the data to shared memory.
+  if (lane == 0) reduce_smem[warp] = prod;
+  __syncthreads(); // make sure the data is in shared memory.
+  // the first warp compute the final sum.
+  prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
+  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod);
+  if (tid == 0) atomicAdd(y, prod);
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void dot_prod_f16x8_pack_f32_kernel(half* a, half* b, float* y, int N) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x;
-    int gid = threadIdx.x + blockIdx.x * blockDim.x;
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    __shared__ float smem[NUM_WARPS];
-    half ra[8];
-    half rb[8];
-    int idx = gid * 8;
-    LDST128BITS(ra[0]) = LDST128BITS(a[idx]);
-    LDST128BITS(rb[0]) = LDST128BITS(b[idx]);
-    float val_f32 = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-      // TODO: use __hmul2
-      val_f32 += idx + i < N ? __half2float(ra[i]) * __half2float(rb[i]) : 0.0f;
-    }
+  int tid = threadIdx.x;
+  int idx = (blockIdx.x * NUM_THREADS + tid) * 8; // 8 half elements per thread
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  __shared__ float reduce_smem[NUM_WARPS];
+  // temporary register(memory), .local space in ptx, addressable
+  half pack_a[8], pack_b[8]; // 8x16 bits=128 bits.
+  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
+  LDST128BITS(pack_b[0]) = LDST128BITS(b[idx]); // load 128 bits
+  const half z = __float2half(0.0f);
+  
+  half prod_f16 = z;
+  #pragma unroll 
+  for (int i = 0; i < 8; i += 2) {
+    half2 v = __hmul2(HALF2(pack_a[i]), HALF2(pack_b[i]));
+    prod_f16 += (((idx + i ) < N) ? (v.x + v.y) : z);
+  }
 
-    val_f32 = warp_reduce_sum_f32<WARP_SIZE>(val_f32);
-    int warp = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    if (lane == 0) smem[warp] = val_f32;
-    __syncthreads();
-
-    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
-    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
-    if (tid == 0) atomicAdd(y, val_f32);
-    // [END MANUAL IMPLEMENTATION]
+  int warp = tid / WARP_SIZE;
+  int lane = tid % WARP_SIZE;
+  // perform warp sync reduce.
+  float prod = warp_reduce_sum_f16_f32<WARP_SIZE>(prod_f16);
+  // warp leaders store the data to shared memory.
+  if (lane == 0) reduce_smem[warp] = prod;
+  __syncthreads(); // make sure the data is in shared memory.
+  // the first warp compute the final sum.
+  prod = (lane < NUM_WARPS) ? reduce_smem[lane] : 0.0f;
+  if (warp == 0) prod = warp_reduce_sum_f32<NUM_WARPS>(prod);
+  if (tid == 0) atomicAdd(y, prod);
 }
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
