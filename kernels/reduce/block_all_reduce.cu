@@ -166,28 +166,98 @@ __global__ void block_all_reduce_sum_f16_f32_kernel(half* a, float* y, int N) {
 template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_f16x2_f32_kernel(half* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    half2 val = gid*2 < N ? HALF2(a[gid*2]) : half2{__float2half(0.0f), __float2half(0.0f)};
+    float val_f32 = __half2float(val.x) + __half2float(val.y);
+    val_f32 = warp_reduce_sum_f32<WARP_SIZE>(val_f32);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_f32;
+    __syncthreads();
+
+    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
+    if (tid == 0) atomicAdd(y, val_f32);
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_f16x2_f16_kernel(half* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ half smem[NUM_WARPS];
+    half2 val = gid*2 < N ? HALF2(a[gid*2]) : half2{__float2half(0.0f), __float2half(0.0f)};
+    half val_f16 = val.x + val.y;
+    val_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(val_f16);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_f16;
+    __syncthreads();
+
+    val_f16 = lane < NUM_WARPS ? smem[lane] : __float2half(0.0f);
+    if (warp == 0) val_f16 = warp_reduce_sum_f16_f16<NUM_WARPS>(val_f16);
+    if (tid == 0) atomicAdd(y, __half2float(val_f16));
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_f16x8_pack_f16_kernel(half* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ half smem[NUM_WARPS];
+    half val[8];
+    int idx = gid * 8;
+    LDST128BITS(val[0]) = LDST128BITS(a[idx]);
+    half val_f16 = __float2half(0.0f);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val_f16 += idx + i < N ? val[i] : __float2half(0.0f);
+    }
+
+    val_f16 = warp_reduce_sum_f16_f16<WARP_SIZE>(val_f16);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_f16;
+    __syncthreads();
+
+    val_f16 = lane < NUM_WARPS ? smem[lane] : __float2half(0.0f);
+    if (warp == 0) val_f16 = warp_reduce_sum_f16_f16<NUM_WARPS>(val_f16);
+    if (tid == 0) atomicAdd(y, __half2float(val_f16));
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_f16x8_pack_f32_kernel(half* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    half val[8];
+    int idx = gid * 8;
+    LDST128BITS(val[0]) = LDST128BITS(a[idx]);
+    float val_f32 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val_f32 += idx + i < N ? __half2float(val[i]) : 0.0f;
+    }
+
+    val_f32 = warp_reduce_sum_f32<WARP_SIZE>(val_f32);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_f32;
+    __syncthreads();
+
+    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
+    if (tid == 0) atomicAdd(y, val_f32);
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -263,7 +333,21 @@ template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_bf16x2_bf16_kernel(
   __nv_bfloat16* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ __nv_bfloat16 smem[NUM_WARPS];
+    __nv_bfloat162 val = gid*2 < N ? BFLOAT2(a[gid*2]) : __nv_bfloat162{__float2bfloat16(0.0f), __float2bfloat16(0.0f)};
+    __nv_bfloat16 val_bf16 = val.x + val.y;
+    val_bf16 = warp_reduce_sum_bf16_bf16<WARP_SIZE>(val_bf16);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_bf16;
+    __syncthreads();
+
+    val_bf16 = lane < NUM_WARPS ? smem[lane] : __float2bfloat16(0.0f);
+    if (warp == 0) val_bf16 = warp_reduce_sum_bf16_bf16<NUM_WARPS>(val_bf16);
+    if (tid == 0) atomicAdd(y, __bfloat162float(val_bf16));
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -271,7 +355,21 @@ template<const int NUM_THREADS = 256/2>
 __global__ void block_all_reduce_sum_bf16x2_f32_kernel(
   __nv_bfloat16* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    __nv_bfloat162 val = gid*2 < N ? BFLOAT2(a[gid*2]) : __nv_bfloat162{__float2bfloat16(0.0f), __float2bfloat16(0.0f)};
+    float val_f32 = __bfloat162float(val.x) + __bfloat162float(val.y);
+    val_f32 = warp_reduce_sum_f32<WARP_SIZE>(val_f32);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_f32;
+    __syncthreads();
+
+    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
+    if (tid == 0) atomicAdd(y, val_f32);
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -279,7 +377,28 @@ template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_bf16x8_pack_bf16_kernel(
   __nv_bfloat16* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ __nv_bfloat16 smem[NUM_WARPS];
+    __nv_bfloat16 val[8];
+    int idx = gid * 8;
+    LDST128BITS(val[0]) = LDST128BITS(a[idx]);
+    __nv_bfloat16 val_bf16 = __float2bfloat16(0.0f);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val_bf16 += idx + i < N ? val[i] : __float2bfloat16(0.0f);
+    }
+
+    val_bf16 = warp_reduce_sum_bf16_bf16<WARP_SIZE>(val_bf16);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_bf16;
+    __syncthreads();
+
+    val_bf16 = lane < NUM_WARPS ? smem[lane] : __float2bfloat16(0.0f);
+    if (warp == 0) val_bf16 = warp_reduce_sum_bf16_bf16<NUM_WARPS>(val_bf16);
+    if (tid == 0) atomicAdd(y, __bfloat162float(val_bf16));
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -287,7 +406,28 @@ template<const int NUM_THREADS = 256/8>
 __global__ void block_all_reduce_sum_bf16x8_pack_f32_kernel(
   __nv_bfloat16* a, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    __shared__ float smem[NUM_WARPS];
+    __nv_bfloat16 val[8];
+    int idx = gid * 8;
+    LDST128BITS(val[0]) = LDST128BITS(a[idx]);
+    float val_f32 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val_f32 += idx + i < N ? __bfloat162float(val[i]) : 0.0f;
+    }
+
+    val_f32 = warp_reduce_sum_f32<WARP_SIZE>(val_f32);
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (lane == 0) smem[warp] = val_f32;
+    __syncthreads();
+
+    val_f32 = lane < NUM_WARPS ? smem[lane] : 0.0f;
+    if (warp == 0) val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
+    if (tid == 0) atomicAdd(y, val_f32);
     // [END MANUAL IMPLEMENTATION]
 }
 
