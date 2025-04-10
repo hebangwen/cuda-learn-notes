@@ -165,14 +165,34 @@ __global__ void softmax_f32x4_kernel(float* x, float* y, float* total, int N) {
 template<const int NUM_THREADS = 256>
 __global__ void softmax_f32_per_token_kernel(float* x, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    float val = gid < N ? x[gid] : 0.0f;
+    val = __expf(val);
+    float sum = block_reduce_sum_f32<NUM_THREADS>(val);
+    val = val / sum;
+    if (gid < N) y[gid] = val;
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/4>
 __global__ void softmax_f32x4_per_token_kernel(float* x, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = (threadIdx.x + blockIdx.x * blockDim.x) * 4;
+    float4 val = gid < N ? FLOAT4(x[gid]) : float4{0.0f, 0.0f, 0.0f, 0.0f};
+    val.x = __expf(val.x);
+    val.y = __expf(val.y);
+    val.z = __expf(val.z);
+    val.w = __expf(val.w);
+    float sum = val.x + val.y + val.z + val.w;
+    sum = block_reduce_sum_f32<NUM_THREADS>(sum);
+    sum = 1.0f / sum;
+    val.x = val.x * sum;
+    val.y = val.y * sum;
+    val.z = val.z * sum;
+    val.w = val.w * sum;
+    if (gid < N) FLOAT4(y[gid]) = val;
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -180,35 +200,104 @@ __global__ void softmax_f32x4_per_token_kernel(float* x, float* y, int N) {
 template<const int NUM_THREADS = 256>
 __global__ void safe_softmax_f32_per_token_kernel(float* x, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    float val = gid < N ? x[gid] : 0.0f;
+    float max_val = block_reduce_max_f32<NUM_THREADS>(val);
+    val -= max_val;
+    val = __expf(val);
+    float sum = block_reduce_sum_f32<NUM_THREADS>(val);
+    val = val / sum;
+    if (gid < N) y[gid] = val;
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256/4>
 __global__ void safe_softmax_f32x4_per_token_kernel(float* x, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = (threadIdx.x + blockIdx.x * blockDim.x) * 4;
+    float4 val = gid < N ? FLOAT4(x[gid]) : float4{0.0f, 0.0f, 0.0f, 0.0f};
+    float max_val = fmaxf(fmaxf(val.x, val.y), fmaxf(val.z, val.w));
+    max_val = block_reduce_max_f32<NUM_THREADS>(max_val);
+    val.x = __expf(val.x - max_val);
+    val.y = __expf(val.y - max_val);
+    val.z = __expf(val.z - max_val);
+    val.w = __expf(val.w - max_val);
+    float sum = val.x + val.y + val.z + val.w;
+    sum = block_reduce_sum_f32<NUM_THREADS>(sum);
+    sum = 1.0f / sum;
+    val.x = val.x * sum;
+    val.y = val.y * sum;
+    val.z = val.z * sum;
+    val.w = val.w * sum;
+    if (gid < N) FLOAT4(y[gid]) = val;
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void safe_softmax_f16_f32_per_token_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+    float val = gid < N ? __half2float(x[gid]) : 0.0f;
+    float max_val = block_reduce_max_f32<NUM_THREADS>(val);
+    val -= max_val;
+    val = __expf(val);
+    float sum = block_reduce_sum_f32<NUM_THREADS>(val);
+    val = val / sum;
+    if (gid < N) y[gid] = __float2half(val);
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void safe_softmax_f16x2_f32_per_token_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
+    half2 val = gid < N ? HALF2(x[gid]) : half2{__float2half(0.0f), __float2half(0.0f)};
+    float2 val_f32 = {__half2float(val.x), __half2float(val.y)};
+    float max_val = fmaxf(val_f32.x, val_f32.y);
+    max_val = block_reduce_max_f32<NUM_THREADS>(max_val);
+    val_f32.x = __expf(val_f32.x - max_val);
+    val_f32.y = __expf(val_f32.y - max_val);
+    float sum = val_f32.x + val_f32.y;
+    sum = block_reduce_sum_f32<NUM_THREADS>(sum);
+    val_f32.x = val_f32.x / sum;
+    val_f32.y = val_f32.y / sum;
+    val = half2{__float2half(val_f32.x), __float2half(val_f32.y)};
+    if (gid < N) HALF2(y[gid]) = val;
     // [END MANUAL IMPLEMENTATION]
 }
 
 template<const int NUM_THREADS = 256>
 __global__ void safe_softmax_f16x8_pack_f32_per_token_kernel(half* x, half* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    int tid = threadIdx.x;
+    int gid = (threadIdx.x + blockIdx.x * blockDim.x) * 8;
+    half val[8];
+    float val_f32[8];
+    LDST128BITS(val[0]) = LDST128BITS(x[gid]);
+    float max_val = __half2float(val[0]);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val_f32[i] = __half2float(val[i]);
+      max_val = fmaxf(val_f32[i], max_val);
+    }
+    max_val = block_reduce_max_f32<NUM_THREADS>(max_val);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val_f32[i] = __expf(val_f32[i] - max_val);
+      sum += val_f32[i];
+    }
+    sum = block_reduce_sum_f32<NUM_THREADS>(sum);
+    sum = 1.0f / sum;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      val[i] = __float2half(val_f32[i] * sum);
+    }
+    if (gid * 8 < N) LDST128BITS(y[gid]) = LDST128BITS(val[0]);
     // [END MANUAL IMPLEMENTATION]
 }
 
