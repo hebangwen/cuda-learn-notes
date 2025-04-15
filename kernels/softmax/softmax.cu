@@ -304,7 +304,54 @@ __global__ void safe_softmax_f16x8_pack_f32_per_token_kernel(half* x, half* y, i
 template<const int NUM_THREADS = 256 >
 __global__ void online_safe_softmax_f32_per_token_kernel(const float* x, float* y, int N) {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+
+    int tid = threadIdx.x;
+    int gid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    float val = gid < N ? x[gid] : -FLT_MAX;
+    MD md{val, 1.0f};
+    md = warp_reduce_md_op<WARP_SIZE>(md);
+
+    // NOTE: 不要使用 block 级别的归约，速度会慢
+
+    // float blk_max = block_reduce_max_f32<NUM_THREADS>(md.m);
+    // float warp_sum_max = md.d * __expf(md.m - blk_max);
+    // __shared__ float smem[NUM_WARPS];
+    // int warp_id = tid / WARP_SIZE;
+    // int lane_id = tid % WARP_SIZE;
+    // if (lane_id == 0) {
+    //     smem[warp_id] = warp_sum_max;
+    // }
+    // __syncthreads();
+
+    // float sum = (lane_id < NUM_WARPS) ? smem[lane_id] : 0.0f;
+    // sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
+
+    __shared__ MD smem[NUM_WARPS];
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    if (lane_id == 0) {
+        smem[warp_id] = md;
+    }
+    __syncthreads();
+
+    // NOTE: 有点像 block_reduce_sum，先进行一遍 warp 级别的归约，然后进行一边 block 级别的归约
+
+    // NOTE: 如果不用 block 同步，而是直接 warp 重新计算一遍，是否会更慢？
+    if (warp_id == 0) {
+      md = lane_id < NUM_WARPS ? smem[lane_id] : MD{-FLT_MAX, 1.0f};
+      md = warp_reduce_md_op<NUM_WARPS>(md);
+      if (lane_id == 0) smem[0] = md;
+    }
+    __syncthreads();
+
+    float sum = smem[0].d;
+    float blk_max = smem[0].m;
+
+    if (gid < N) {
+      y[gid] = (sum > 0.0f) ? __expf(val - blk_max) / sum : 0.0f;
+    }
     // [END MANUAL IMPLEMENTATION]
 }
 
@@ -312,8 +359,42 @@ template <const int NUM_THREADS = 256 / 4>
 __global__ void online_safe_softmax_f32x4_pack_per_token_kernel(float *x, float *y, int N)
 {
     // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
-    // [END MANUAL IMPLEMENTATION]
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+
+    int tid = threadIdx.x;
+    int gid = (threadIdx.x + blockIdx.x * blockDim.x) * 4;
+
+    float4 val = gid < N ? FLOAT4(x[gid]) : float4{0.0f, 0.0f, 0.0f, 0.0f};
+    float max_val = fmaxf(fmaxf(val.x, val.y), fmaxf(val.z, val.w));
+    float d_val = __expf(val.x - max_val) + __expf(val.y - max_val) + __expf(val.z - max_val) + __expf(val.w - max_val);
+    MD md{max_val, d_val};
+    md = warp_reduce_md_op<WARP_SIZE>(md);
+
+    __shared__ MD smem[NUM_WARPS];
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    if (lane_id == 0) {
+        smem[warp_id] = md;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+      md = lane_id < NUM_WARPS ? smem[lane_id] : MD{-FLT_MAX, 1.0f};
+      md = warp_reduce_md_op<NUM_WARPS>(md);
+      if (lane_id == 0) smem[0] = md;
+    }
+    __syncthreads();
+
+    float sum = 1.0f / smem[0].d;
+    float blk_max = smem[0].m;
+    val.x = __expf(val.x - blk_max) * sum;
+    val.y = __expf(val.y - blk_max) * sum;
+    val.z = __expf(val.z - blk_max) * sum;
+    val.w = __expf(val.w - blk_max) * sum;
+    if (gid < N) {
+      FLOAT4(y[gid]) = val;
+    }
+    // // [END MANUAL IMPLEMENTATION]
 }
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
