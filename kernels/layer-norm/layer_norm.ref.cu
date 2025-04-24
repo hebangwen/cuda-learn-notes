@@ -43,7 +43,6 @@ __device__ float block_reduce_sum_f32(float val) {
   __syncthreads();
   val = (lane < NUM_WARPS) ? shared[lane] : 0.0f;
   val = warp_reduce_sum_f32<NUM_WARPS>(val);
-  val = __shfl_sync(0xffffffff, val, 0, 32);
   return val;
 }
 
@@ -53,18 +52,24 @@ __device__ float block_reduce_sum_f32(float val) {
 // y=y'*g + b (g: scale, b: bias)
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f32_kernel(float* x, float* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= N * K) return;
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = bid * blockDim.x + threadIdx.x;
+  const float epsilon = 1e-5f;
 
-    float val = x[tid];
-    float sum = block_reduce_sum_f32<NUM_THREADS>(val);
-    float mean = sum / K;
-    float shift = val - mean;
-    sum = block_reduce_sum_f32<NUM_THREADS>(shift * shift);
-    float inv_std = rsqrtf(sum / K);
-    y[tid] = shift * inv_std * g + b;
-    // [END MANUAL IMPLEMENTATION]
+  __shared__ float s_mean; // shared within block
+  __shared__ float s_variance; // shared within block
+  float value = (idx < N * K) ? x[idx] : 0.0f; // load once only
+  float sum = block_reduce_sum_f32<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / (float) K;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  float variance = (value - s_mean) * (value - s_mean);
+  variance = block_reduce_sum_f32<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = rsqrtf(variance / ((float) K + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  if (idx < N * K) y[idx] = ((value - s_mean) * s_variance) * g + b;
 }
 
 // Layer Norm Vec4: x: NxK(K=256<1024), y': NxK, y'=x-mean(x)/std(x) each row
@@ -73,27 +78,37 @@ __global__ void layer_norm_f32_kernel(float* x, float* y, float g, float b, int 
 // y=y'*g + b (g: scale, b: bias)
 template<const int NUM_THREADS=256/4>
 __global__ void layer_norm_f32x4_kernel(float* x, float* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = (threadIdx.x + blockIdx.x * blockDim.x) * 4;
-    if (tid >= N * K) return;
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = (bid * blockDim.x + threadIdx.x) * 4;
+  const float epsilon = 1e-5f;
 
-    float4 val = FLOAT4(x[tid]);
-    float sum = block_reduce_sum_f32<NUM_THREADS>(val.x + val.y + val.z + val.w);
-    float mean = sum / K;
-    float4 shift;
-    shift.x = val.x - mean;
-    shift.y = val.y - mean;
-    shift.z = val.z - mean;
-    shift.w = val.w - mean;
-    float square_sum = shift.x * shift.x + shift.y * shift.y + shift.z * shift.z + shift.w * shift.w;
-    sum = block_reduce_sum_f32<NUM_THREADS>(square_sum);
-    float inv_std = rsqrtf(sum / K);
-    shift.x = shift.x * inv_std * g + b;
-    shift.y = shift.y * inv_std * g + b;
-    shift.z = shift.z * inv_std * g + b;
-    shift.w = shift.w * inv_std * g + b;
-    FLOAT4(y[tid]) = shift;
-    // [END MANUAL IMPLEMENTATION]
+  __shared__ float s_mean; // shared within block
+  __shared__ float s_variance; // shared within block
+  float4 reg_x = FLOAT4(x[idx]);
+  float value = (idx < N * K) ? (reg_x.x + reg_x.y 
+                               + reg_x.z + reg_x.w) : 0.0f;
+  float sum = block_reduce_sum_f32<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / (float) K;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  float4 reg_x_hat;
+  reg_x_hat.x = reg_x.x - s_mean;
+  reg_x_hat.y = reg_x.y - s_mean;
+  reg_x_hat.z = reg_x.z - s_mean;
+  reg_x_hat.w = reg_x.w - s_mean;
+  float variance = reg_x_hat.x * reg_x_hat.x + reg_x_hat.y * reg_x_hat.y 
+                 + reg_x_hat.z * reg_x_hat.z + reg_x_hat.w * reg_x_hat.w;
+  variance = block_reduce_sum_f32<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = rsqrtf(variance / ((float) K + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  float4 reg_y;
+  reg_y.x = reg_x_hat.x * s_variance * g + b;
+  reg_y.y = reg_x_hat.y * s_variance * g + b;
+  reg_y.z = reg_x_hat.z * s_variance * g + b;
+  reg_y.w = reg_x_hat.w * s_variance * g + b;
+  if (idx < N * K) FLOAT4(y[idx]) = reg_y;
 }
 
 // -------------------------------------- FP16 -------------------------------------- 
@@ -131,7 +146,6 @@ __device__ half block_reduce_sum_f16_f16(half val) {
   __syncthreads();
   val = (lane < NUM_WARPS) ? shared[lane] : __float2half(0.0f);
   val = warp_reduce_sum_f16_f16<NUM_WARPS>(val);
-  val = __shfl_sync(0xffffffff, val, 0, 32);
   return val; // half
 }
 
@@ -148,47 +162,69 @@ __device__ float block_reduce_sum_f16_f32(half val) {
   __syncthreads();
   val_f32 = (lane < NUM_WARPS) ? shared[lane] : 0.0f;
   val_f32 = warp_reduce_sum_f32<NUM_WARPS>(val_f32);
-  val = __shfl_sync(0xffffffff, val, 0, 32);
   return val_f32; // float
 }
 
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f16_f16_kernel(half* x, half* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= N * K) return;
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = bid * blockDim.x + threadIdx.x;
+  const half epsilon = __float2half(1e-5f);
+  const half g_      = __float2half(g);
+  const half b_      = __float2half(b);
+  const half K_      = __int2half_rn(K);
 
-    half val = x[tid];
-    half sum = block_reduce_sum_f16_f16<NUM_THREADS>(val);
-    half mean = __hdiv(sum, K);
-    half shift = val - mean;
-    sum = block_reduce_sum_f16_f16<NUM_THREADS>(shift * shift);
-    half inv_std = hrsqrt(__hdiv(sum, K));
-    y[tid] = shift * inv_std * __float2half(g) + __float2half(b);
-    // [END MANUAL IMPLEMENTATION]
+  __shared__ half s_mean; // shared within block
+  __shared__ half s_variance; // shared within block
+  half value = (idx < N * K) ? x[idx] : __float2half(0.0f); // load once only
+  half sum = block_reduce_sum_f16_f16<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / K_;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  half variance = (value - s_mean) * (value - s_mean);
+  variance = block_reduce_sum_f16_f16<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = hrsqrt(variance / (K_ + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  if (idx < N * K) { 
+    y[idx] = __hfma((value - s_mean) * s_variance, g_, b_);
+    // y[idx] = ((value - s_mean) * s_variance) * g_ + b_; 
+  }
 }
 
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f16x2_f16_kernel(half* x, half* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = (threadIdx.x + blockIdx.x * blockDim.x) * 2;
-    if (tid >= N * K) return;
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = (bid * blockDim.x + threadIdx.x) * 2;
+  const half epsilon = __float2half(1e-5f);
+  const half g_      = __float2half(g);
+  const half b_      = __float2half(b);
+  const half K_      = __int2half_rn(K);
 
-    half2 val = HALF2(x[tid]);
-    half sum = block_reduce_sum_f16_f16<NUM_THREADS>(val.x + val.y);
-    half mean = __hdiv(sum, K);
-    half2 shift;
-    shift.x = val.x - mean;
-    shift.y = val.y - mean;
-    half square_sum = shift.x * shift.x + shift.y * shift.y;
-    sum = block_reduce_sum_f16_f16<NUM_THREADS>(square_sum);
-    half inv_std = hrsqrt(__hdiv(sum, K));
-    half g_ = __float2half(g);
-    half b_ = __float2half(b);
-    shift.x = __hfma(shift.x * inv_std, g_, b_);
-    shift.y = __hfma(shift.y * inv_std, g_, b_);
-    HALF2(y[tid]) = shift;
-    // [END MANUAL IMPLEMENTATION]
+  __shared__ half s_mean; // shared within block
+  __shared__ half s_variance; // shared within block
+  half2 reg_x = HALF2(x[idx]);
+  half value = (idx < N * K) ? (reg_x.x + reg_x.y) : __float2half(0.0f);
+  half sum = block_reduce_sum_f16_f16<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / K_;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  half2 reg_x_hat;
+  reg_x_hat.x = reg_x.x - s_mean;
+  reg_x_hat.y = reg_x.y - s_mean;
+  half variance = reg_x_hat.x * reg_x_hat.x + reg_x_hat.y * reg_x_hat.y;
+  variance = block_reduce_sum_f16_f16<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = hrsqrt(variance / (K_ + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  if (idx < N * K) { 
+    half2 reg_y;
+    reg_y.x = __hfma(reg_x_hat.x * s_variance, g_, b_);
+    reg_y.y = __hfma(reg_x_hat.y * s_variance, g_, b_);
+    HALF2(y[idx]) = reg_y;
+  }
 }
 
 #define HALF2_SUM(reg, i) \
@@ -206,68 +242,178 @@ __global__ void layer_norm_f16x2_f16_kernel(half* x, half* y, float g, float b, 
 
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f16x8_f16_kernel(half* x, half* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
-    // [END MANUAL IMPLEMENTATION]
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = (bid * blockDim.x + threadIdx.x) * 8;
+  const half epsilon = __float2half(1e-5f);
+  const half g_      = __float2half(g);
+  const half b_      = __float2half(b);
+  const half K_      = __int2half_rn(K);
+
+  __shared__ half s_mean; // shared within block
+  __shared__ half s_variance; // shared within block
+  half2 reg_x_0 = HALF2(x[idx + 0]);
+  half2 reg_x_1 = HALF2(x[idx + 2]);
+  half2 reg_x_2 = HALF2(x[idx + 4]);
+  half2 reg_x_3 = HALF2(x[idx + 6]);
+
+  half value = HALF2_SUM(reg_x_0, 0);
+  value     += HALF2_SUM(reg_x_1, 2);
+  value     += HALF2_SUM(reg_x_2, 4);
+  value     += HALF2_SUM(reg_x_3, 6);
+
+  half sum = block_reduce_sum_f16_f16<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / K_;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  // manual unroll
+  half2 reg_x_hat_0, reg_x_hat_1, reg_x_hat_2, reg_x_hat_3;
+  HALF2_SUB(reg_x_hat_0, reg_x_0);
+  HALF2_SUB(reg_x_hat_1, reg_x_1);
+  HALF2_SUB(reg_x_hat_2, reg_x_2);
+  HALF2_SUB(reg_x_hat_3, reg_x_3);
+
+  half variance = HALF2_VARIANCE(reg_x_hat_0, 0);
+  variance     += HALF2_VARIANCE(reg_x_hat_1, 2);
+  variance     += HALF2_VARIANCE(reg_x_hat_2, 4);
+  variance     += HALF2_VARIANCE(reg_x_hat_3, 6);
+
+  variance = block_reduce_sum_f16_f16<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = hrsqrt(variance / (K_ + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  // manual unroll
+  half2 reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+  HALF2_LAYER_NORM(reg_y_0, reg_x_hat_0, g_, b_);
+  HALF2_LAYER_NORM(reg_y_1, reg_x_hat_1, g_, b_);
+  HALF2_LAYER_NORM(reg_y_2, reg_x_hat_2, g_, b_);
+  HALF2_LAYER_NORM(reg_y_3, reg_x_hat_3, g_, b_);
+  
+  if ((idx + 0) < N * K) { HALF2(y[idx + 0]) = reg_y_0; }
+  if ((idx + 2) < N * K) { HALF2(y[idx + 2]) = reg_y_1; }
+  if ((idx + 4) < N * K) { HALF2(y[idx + 4]) = reg_y_2; }
+  if ((idx + 6) < N * K) { HALF2(y[idx + 6]) = reg_y_3; }
 }
 
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f16_f32_kernel(half* x, half* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= N * K) return;
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = bid * blockDim.x + threadIdx.x;
+  const float epsilon = 1e-5f;
 
-    half val = x[tid];
-    float sum = block_reduce_sum_f16_f32<NUM_THREADS>(val);
-    float mean = sum / K;
-    float shift = __half2float(val) - mean;
-    sum = block_reduce_sum_f32<NUM_THREADS>(shift * shift);
-    float inv_std = rsqrtf(sum / K);
-    y[tid] = __float2half(shift * inv_std * g + b);
-    // [END MANUAL IMPLEMENTATION]
+  __shared__ float s_mean; // shared within block
+  __shared__ float s_variance; // shared within block
+  float value = (idx < N * K) ? __half2float(x[idx]) : 0.0f; // load once only
+  float sum = block_reduce_sum_f32<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / (float) K;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  float variance = (value - s_mean) * (value - s_mean);
+  variance = block_reduce_sum_f32<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = rsqrtf(variance / ((float) K + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  if (idx < N * K) {
+    // x*y + z -> x'*g + b
+    y[idx] = __float2half(
+      __fmaf_rn(((value - s_mean) * s_variance), g, b)); 
+  }
 }
 
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f16x8_pack_f16_kernel(half* x, half* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    int tid = (threadIdx.x + blockIdx.x * blockDim.x) * 8;
-    if (tid >= N * K) return;
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = (bid * blockDim.x + threadIdx.x) * 8;
+  const half epsilon = __float2half(1e-5f);
+  const half g_      = __float2half(g);
+  const half b_      = __float2half(b);
+  const half K_      = __int2half_rn(K);
+  const half z_      = __float2half(0.0f);
 
-    half reg[8];
-    LDST128BITS(reg[0]) = LDST128BITS(x[tid]);
-    half sum = ((reg[0] + reg[1]) + (reg[2] + reg[3])) + ((reg[4] + reg[5]) + (reg[6] + reg[7]));
-    sum = block_reduce_sum_f16_f16<NUM_THREADS>(sum);
-    half mean = __hdiv(sum, K);
-    reg[0] = reg[0] - mean;
-    reg[1] = reg[1] - mean;
-    reg[2] = reg[2] - mean;
-    reg[3] = reg[3] - mean;
-    reg[4] = reg[4] - mean;
-    reg[5] = reg[5] - mean;
-    reg[6] = reg[6] - mean;
-    reg[7] = reg[7] - mean;
-    half square_sum = ((reg[0] * reg[0] + reg[1] * reg[1]) + (reg[2] * reg[2] + reg[3] * reg[3])) + ((reg[4] * reg[4] + reg[5] * reg[5]) + (reg[6] * reg[6] + reg[7] * reg[7]));
-    sum = block_reduce_sum_f16_f16<NUM_THREADS>(square_sum);
-    half inv_std = hrsqrt(__hdiv(sum, K));
-    half g_ = __float2half(g);
-    half b_ = __float2half(b);
-    reg[0] = __hfma(reg[0] * inv_std, g_, b_);
-    reg[1] = __hfma(reg[1] * inv_std, g_, b_);
-    reg[2] = __hfma(reg[2] * inv_std, g_, b_);
-    reg[3] = __hfma(reg[3] * inv_std, g_, b_);
-    reg[4] = __hfma(reg[4] * inv_std, g_, b_);
-    reg[5] = __hfma(reg[5] * inv_std, g_, b_);
-    reg[6] = __hfma(reg[6] * inv_std, g_, b_);
-    reg[7] = __hfma(reg[7] * inv_std, g_, b_);
-    LDST128BITS(y[tid]) = LDST128BITS(reg[0]);
-    // [END MANUAL IMPLEMENTATION]
+  __shared__ half s_mean; // shared within block
+  __shared__ half s_variance; // shared within block
+  // temporary register(memory), .local space in ptx, addressable
+  half pack_x[8], pack_y[8]; // 8x16 bits=128 bits.
+  // reinterpret as float4 and load 128 bits in 1 memory issue.
+  LDST128BITS(pack_x[0]) = LDST128BITS(x[idx]); // load 128 bits
+  
+  half value = z_;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    value += ((idx + i) < N * K ? pack_x[i] : z_);
+  }
+  half sum = block_reduce_sum_f16_f16<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / K_;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+  
+  half variance = z_;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    half v_hat = pack_x[i] - s_mean;
+    variance += ((idx + i) < N * K ? v_hat * v_hat : z_);
+  }
+  variance = block_reduce_sum_f16_f16<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = hrsqrt(variance / (K_ + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) { 
+    // TODO: use __hfma2, __hsub2, __hmul2 here
+    pack_y[i] = __hfma((pack_x[i] - s_mean) * s_variance, g_, b_);
+  }
+  // reinterpret as float4 and store 128 bits in 1 memory issue.
+  if ((idx + 7) < N * K) { LDST128BITS(y[idx]) = LDST128BITS(pack_y[0]); }
+  // TODO: support non 8-multiple K here
 }
 
 template<const int NUM_THREADS=256>
 __global__ void layer_norm_f16x8_pack_f32_kernel(half* x, half* y, float g, float b, int N, int K) {
-    // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
-    // [END MANUAL IMPLEMENTATION]
+  int tid = threadIdx.x; // 0..K-1
+  int bid = blockIdx.x; // 0..N-1
+  int idx = (bid * blockDim.x + threadIdx.x) * 8;
+  const float epsilon = 1e-5f;
+
+  __shared__ float s_mean; // shared within block
+  __shared__ float s_variance; // shared within block
+  // temporary register(memory), .local space in ptx, addressable
+  half pack_x[8], pack_y[8]; // 8x16 bits=128 bits.
+  // reinterpret as float4 and load 128 bits in 1 memory issue.
+  LDST128BITS(pack_x[0]) = LDST128BITS(x[idx]); // load 128 bits
+
+  float value = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    value += ((idx + i) < N * K ? __half2float(pack_x[i]) : 0.0f);
+  }
+  float sum = block_reduce_sum_f32<NUM_THREADS>(value);
+  if (tid == 0) s_mean = sum / (float) K;
+  // wait for s_mean in shared memory to be ready for all threads
+  __syncthreads();
+
+  float variance = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float v_hat = __half2float(pack_x[i]) - s_mean;
+    variance += ((idx + i) < N * K ? v_hat * v_hat : 0.0f);
+  }
+  variance = block_reduce_sum_f32<NUM_THREADS>(variance);
+  if (tid == 0) s_variance = rsqrtf(variance / ((float) K + epsilon));
+  // wait for s_variance in shared memory to be ready for all threads
+  __syncthreads();
+  
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    pack_y[i] = __float2half(
+      __fmaf_rn(((__half2float(pack_x[i]) - s_mean) * s_variance), g, b)
+    );
+  }
+  // reinterpret as float4 and store 128 bits in 1 memory issue.
+  if ((idx + 7) < N * K) { LDST128BITS(y[idx]) = LDST128BITS(pack_y[0]); }
+  // TODO: support non 8-multiple K here
 }
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
