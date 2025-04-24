@@ -59,7 +59,7 @@ def run_benchmark(
     total_time = (end - start) * 1000  # ms
     mean_time = total_time / iters
     out_info = f"out_{tag}"
-    out_val = out.flatten().detach().cpu().numpy().tolist()[:3]
+    out_val = out.flatten().detach().cpu().numpy().tolist()[a.shape[1]:3+a.shape[1]]
     out_val = [round(v, 8) for v in out_val]
     out_val = [f"{v:<12}" for v in out_val]
     print(f"{out_info:>20}: {out_val}, time:{mean_time:.6f}ms")
@@ -68,27 +68,31 @@ def run_benchmark(
     return out.clone(), mean_time
 
 
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    return q_embed
+
+
 def naive_rope(
     x: torch.Tensor,
     theta: float = 10000.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     dim = x.shape[-1]
     seq_len = x.shape[-2]
-    # get the shape of x (ignore the head dimension). 
-    # x: [batch_size, seq_len, dim]
-    x_ = x.float().reshape(*x.shape[:-1], -1, 2)
-    # x_: [batch_size, seq_len, dim//2, 2]
-    x_ = torch.view_as_complex(x_)
-    # pack neibored element into a complex
-    # x_: [batch_size, seq_len, dim//2, 1]. eg: tensor([(1.6116-0.5772j), ...]
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    freqs = torch.cat((freqs, freqs), dim=-1)
     t = torch.arange(seq_len , device=freqs.device)
     freqs = torch.outer(t, freqs).float().cuda()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) 
-    # get rotate angle
-    xq_out = torch.view_as_real(x_ * freqs_cis).flatten(1)
-    # do rotate
-    return xq_out.type_as(x)
+    cos = freqs.cos()
+    sin = freqs.sin()
+    out = apply_rotary_pos_emb(x, cos, sin)
+    return out
 
 print("-" * 100)
 M = [4096, 8192]

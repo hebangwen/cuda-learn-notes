@@ -12,70 +12,58 @@
 
 #define INT4(value) (reinterpret_cast<int4*>(&(value))[0])
 #define FLOAT4(value) (reinterpret_cast<float4*>(&(value))[0])
-#define FLOAT2(value) (reinterpret_cast<float2*>(&(value))[0])
 #define HALF2(value) (reinterpret_cast<half2*>(&(value))[0])
 #define BFLOAT2(value) (reinterpret_cast<__nv_bfloat162*>(&(value))[0])
 #define BLOCK_SIZE 256
-#define THETA 10000.0f
+#define theta 10000.0f
 
-// N = hidden_size / 2
-// seq_len = seq_len
-// block = BLOCK_SIZE
-// grid = seq_len * N / BLOCK_SIZE
-__global__ void rope_f32_kernel(float* x, float* out, int seq_len, int N){
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int dim_id = tid % N;
-    int seq_id = tid / N;
-    float freq = seq_id / powf(THETA, float(dim_id) / N);
-    float cos, sin;
-    __sincosf(freq, &sin, &cos);
-
-    int base_idx = tid + seq_id * N;
-    float v1 = x[base_idx];
-    float v2 = x[base_idx + N];
-    float o1 = v1 * cos - v2 * sin;
-    float o2 = v2 * cos + v1 * sin;
-    out[base_idx] = o1;
-    out[base_idx + N] = o2;
-    // [END MANUAL IMPLEMENTATION]
+__global__ void rope_f32_kernel(float* x, float* out, int seq_len, int N){ 
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  float x1 = x[idx * 2];
+  float x2 = x[idx * 2 + 1];
+  int token_pos = idx / N; 
+  int token_idx = idx % N;
+  float exp_v = 1.0f / powf(theta, token_idx / (N * 2));
+  float sin_v = sinf(token_pos / exp_v);
+  float cos_v = cosf(token_pos / exp_v);
+  float out1 = x1 * cos_v - x2 * sin_v;
+  float out2 = x1 * sin_v + x2 * cos_v;
+  out[idx * 2] = out1;
+  out[idx * 2 + 1] = out2;
 }
 
 // another index method of rope.
-__global__ void rope_f32_v2_kernel(float* x, float* out, int seq_len, int N){
-    // [START MANUAL IMPLEMENTATION]
-    // TODO: 请在此实现内核代码
-    // [END MANUAL IMPLEMENTATION]
+__global__ void rope_f32_v2_kernel(float* x, float* out, int seq_len, int N){ 
+  int token_pos = blockIdx.x;
+  int tid = threadIdx.x;
+  float x1 = x[token_pos * N * 2 + tid * 2];
+  float x2 = x[token_pos * N * 2 + tid * 2 + 1];
+  float exp_v = 1.0f / powf(theta, (int)(tid / 2) / (N * 2));
+  float sin_v = sinf(token_pos / exp_v);
+  float cos_v = cosf(token_pos / exp_v);
+  float out1 = x1 * cos_v - x2 * sin_v;
+  float out2 = x1 * sin_v + x2 * cos_v;
+  out[token_pos * N * 2 + tid * 2] = out1;
+  out[token_pos * N * 2 + tid * 2 + 1] = out2;
 }
 
-// N = hidden_size / 4
-// seq_len = seq_len
-// block = BLOCK_SIZE
-// grid = seq_len * N / BLOCK_SIZE
-__global__ void rope_f32x4_pack_kernel(float* x, float* out, int seq_len, int N){
-    // [START MANUAL IMPLEMENTATION]
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int seq_id = tid / N;
-    int dim_id = 2 * (tid % N);
-    float theta1 = seq_id / powf(THETA, float(dim_id) / (N * 2));
-    float theta2 = seq_id / powf(THETA, float(dim_id + 1) / (N * 2));
-    float cos1, sin1, cos2, sin2;
-    __sincosf(theta1, &sin1, &cos1);
-    __sincosf(theta2, &sin2, &cos2);
-
-    int base_idx = seq_id * N * 4 + dim_id;
-    float2 cos_x = FLOAT2(x[base_idx]);
-    float2 sin_x = FLOAT2(x[base_idx + N * 2]);
-
-    float2 head, tail;
-    head.x = cos_x.x * cos1 - sin_x.x * sin1;
-    head.y = cos_x.y * cos2 - sin_x.y * sin2;
-    tail.x = sin_x.x * cos1 + cos_x.x * sin1;
-    tail.y = sin_x.y * cos2 + cos_x.y * sin2;
-
-    FLOAT2(out[base_idx]) = head;
-    FLOAT2(out[base_idx + N * 2]) = tail;
-    // [END MANUAL IMPLEMENTATION]
+__global__ void rope_f32x4_pack_kernel(float* x, float* out, int seq_len, int N){ 
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  float4 x_v = FLOAT4(x[idx * 4]);
+  int token_pos = idx / N; 
+  int token_idx = idx % N;
+  float exp_f_v = 1.0f / powf(theta, token_idx * 2 / (N * 4));
+  float exp_s_v = 1.0f / powf(theta, ((token_idx * 2) + 1) / (N * 4));
+  float sin_f_v = sinf(token_pos / exp_f_v);
+  float cos_f_v = cosf(token_pos / exp_f_v);
+  float sin_s_v = sinf(token_pos / exp_s_v);
+  float cos_s_v = cosf(token_pos / exp_s_v);
+  float4 out_v;
+  out_v.x = x_v.x * cos_f_v - x_v.y * sin_f_v;
+  out_v.y = x_v.x * sin_f_v + x_v.y * cos_f_v;
+  out_v.z = x_v.z * cos_s_v - x_v.w * sin_s_v;
+  out_v.w = x_v.z * sin_s_v + x_v.w * cos_s_v; 
+  FLOAT4(out[idx * 4]) = out_v;
 }
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
